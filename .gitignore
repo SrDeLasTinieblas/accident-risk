@@ -39,7 +39,7 @@ desktop.ini
 *.parquet
 
 # === Modelos pesados ===
-*.h5
+# *.h5
 *.hdf5
 *.pb
 *.ckpt
