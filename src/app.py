@@ -17,6 +17,16 @@ model = load_model(MODEL_PATH)
 
 app = Flask(__name__)
 
+# === Health Check ===
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "message": "🚀 Modelo cargado correctamente y servidor activo"
+    }), 200
+
+
+# === Predicción ===
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.json
@@ -54,6 +64,7 @@ def predict():
         "mensaje": mensaje,
         "riesgo": prob  # por compatibilidad con versiones anteriores
     })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
