@@ -40,14 +40,14 @@ desktop.ini
 
 # === Modelos pesados ===
 # *.h5
-*.hdf5
-*.pb
-*.ckpt
-*.tflite
-*.onnx
-/models/
-checkpoints/
-saved_models/
+# *.hdf5
+# *.pb
+# *.ckpt
+# *.tflite
+# *.onnx
+# /models/
+# checkpoints/
+# saved_models/
 
 # === Configuración sensible ===
 /config/
