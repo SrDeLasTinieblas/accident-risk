@@ -5,7 +5,7 @@ import numpy as np
 
 # === Paths ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "..", "models", "model.h5")
+MODEL_PATH = os.path.join(BASE_DIR, "..", "models", "model_riesgo_accidentes.h5")
 
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(
