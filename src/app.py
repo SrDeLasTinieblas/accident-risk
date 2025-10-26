@@ -287,4 +287,5 @@ if __name__ == "__main__":
     print(f"   Longitud: [{feature_info['lon_min']:.2f}, {feature_info['lon_max']:.2f}]")
     print("="*50 + "\n")
     
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
