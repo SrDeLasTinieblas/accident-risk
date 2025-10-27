@@ -5,15 +5,18 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.utils import resample
-from sklearn.cluster import KMeans
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.ensemble import RandomForestClassifier
 from joblib import dump
 import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime
+from scipy.spatial import cKDTree
+import warnings
+warnings.filterwarnings('ignore')
+
+print("="*70)
+print("🚗 MODELO PREDICTIVO DE ACCIDENTES - Ruta Arequipa-Camaná")
+print("="*70)
 
 # === CONFIGURACIÓN ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,35 +24,49 @@ DATA_DIR = os.path.join(BASE_DIR, "..", "data")
 MODEL_DIR = os.path.join(BASE_DIR, "..", "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# === CARGA DE DATOS ===
-print("🔄 Cargando archivos Excel...")
+# === FASE 1: CARGA DE DATOS ===
+print("\n📂 FASE 1: Cargando archivos Excel...")
 files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
-dfs = []
+files.sort()
 
+dfs = []
 for f in files:
     try:
         df = pd.read_excel(f, engine='openpyxl')
         df['__source_file'] = os.path.basename(f)
         dfs.append(df)
-        print(f"  ✓ {os.path.basename(f)}: {len(df)} registros")
+        print(f"   ✓ {os.path.basename(f)}: {len(df):,} registros")
     except Exception as e:
-        print(f"  ✗ Error en {os.path.basename(f)}: {e}")
+        print(f"   ✗ Error en {os.path.basename(f)}: {e}")
 
 if not dfs:
-    raise SystemExit("❌ No se cargaron archivos .xlsx")
+    raise SystemExit("❌ No se cargaron archivos Excel")
 
 data = pd.concat(dfs, ignore_index=True)
-print(f"\n✅ Total: {len(dfs)} archivos | {len(data)} registros")
+print(f"\n✅ Total cargado: {len(dfs)} archivos | {len(data):,} registros")
 
-# === PREPARACIÓN DE DATOS ===
-print("\n🔧 Preparando datos...")
+# === FASE 2: PREPROCESAMIENTO ===
+print("\n🔧 FASE 2: Preprocesamiento de datos...")
 
-# Seleccionar columnas relevantes
+print("   → Limpiando datos básicos...")
+# Columnas necesarias
 cols_necesarias = ["edad_persona", "xx", "yy", "fec_hora_hecho"]
-data = data[cols_necesarias].dropna()
-print(f"  • Registros después de limpiar: {len(data)}")
 
-# Convertir fecha/hora
+# Verificar que existan las columnas
+for col in cols_necesarias:
+    if col not in data.columns:
+        raise ValueError(f"❌ Columna '{col}' no encontrada en los datos")
+
+# Seleccionar solo columnas necesarias
+data = data[cols_necesarias].copy()
+
+# Eliminar filas con coordenadas nulas (crítico)
+data = data.dropna(subset=["xx", "yy", "fec_hora_hecho"])
+
+print(f"      Registros después de limpieza: {len(data):,}")
+
+# === PROCESAMIENTO DE FECHAS ===
+print("   → Procesando fechas y horas...")
 data["fec_hora_hecho"] = pd.to_datetime(data["fec_hora_hecho"], errors="coerce")
 data = data.dropna(subset=["fec_hora_hecho"])
 
@@ -59,8 +76,17 @@ data["mes"] = data["fec_hora_hecho"].dt.month
 data["dia_semana"] = data["fec_hora_hecho"].dt.dayofweek
 data["es_fin_semana"] = (data["dia_semana"] >= 5).astype(int)
 
-# Categorizar horas
+# === PROCESAMIENTO DE EDAD ===
+print("   → Procesando edad...")
+
+# Llenar edades nulas con la mediana
+edad_mediana = data["edad_persona"].median()
+data["edad_persona"] = data["edad_persona"].fillna(edad_mediana)
+
+# Categorizar horas del día
 def categorizar_hora(hora):
+    if pd.isna(hora):
+        return 1  # Default: tarde
     if 6 <= hora < 12:
         return 0  # Mañana
     elif 12 <= hora < 18:
@@ -72,418 +98,347 @@ def categorizar_hora(hora):
 
 data["periodo_dia"] = data["hora"].apply(categorizar_hora)
 
-# === FEATURES GEOESPACIALES MEJORADAS ===
-print("\n🗺️ Creando features geoespaciales...")
-
-# 1. Clustering de zonas (identifica "hotspots")
-n_clusters = 20
-kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-coords = data[["xx", "yy"]].values
-data["cluster_zona"] = kmeans.fit_predict(coords)
-
-# Guardar el modelo de clustering
-kmeans_path = os.path.join(MODEL_DIR, "kmeans_zonas.joblib")
-dump(kmeans, kmeans_path)
-print(f"  ✓ Modelo KMeans guardado: {kmeans_path}")
-
-# 2. Distancia al centro de cada cluster
-centroids = kmeans.cluster_centers_
-for i in range(n_clusters):
-    data[f"dist_cluster_{i}"] = np.sqrt(
-        (data["xx"] - centroids[i][0])**2 + 
-        (data["yy"] - centroids[i][1])**2
-    )
-
-# Usar solo las 5 distancias más cercanas para cada punto
-dist_cols = [f"dist_cluster_{i}" for i in range(n_clusters)]
-data["dist_min_1"] = data[dist_cols].min(axis=1)
-data["dist_min_2"] = data[dist_cols].apply(lambda x: x.nsmallest(2).iloc[-1], axis=1)
-data["dist_min_3"] = data[dist_cols].apply(lambda x: x.nsmallest(3).iloc[-1], axis=1)
-
-# 3. Densidad local (accidentes en radio de ~1km)
-data["lat_zona"] = data["xx"].round(2)
-data["lon_zona"] = data["yy"].round(2)
-densidad_local = data.groupby(["lat_zona", "lon_zona"]).size().reset_index(name="densidad_local")
-data = data.merge(densidad_local, on=["lat_zona", "lon_zona"])
-
-# 4. Estadísticas temporales por cluster
-for cluster in range(n_clusters):
-    cluster_data = data[data["cluster_zona"] == cluster]
-    accidentes_cluster = len(cluster_data)
-    data.loc[data["cluster_zona"] == cluster, "accidentes_cluster"] = accidentes_cluster
-
-# === CREAR VARIABLE OBJETIVO ===
-print("\n📊 Calculando nivel de riesgo...")
-
-# Usar densidad local como base para el riesgo
-percentil_33 = data["densidad_local"].quantile(0.33)
-percentil_66 = data["densidad_local"].quantile(0.66)
-
-def clasificar_riesgo(densidad):
-    if densidad <= percentil_33:
-        return 0  # Riesgo BAJO
-    elif densidad <= percentil_66:
-        return 1  # Riesgo MEDIO
+# Categorizar edad
+def categorizar_edad(edad):
+    if pd.isna(edad):
+        return 2  # Default: adulto
+    if edad < 18:
+        return 0  # Menor
+    elif edad < 30:
+        return 1  # Joven
+    elif edad < 60:
+        return 2  # Adulto
     else:
-        return 2  # Riesgo ALTO
+        return 3  # Mayor
 
-data["nivel_riesgo"] = data["densidad_local"].apply(clasificar_riesgo)
+data["grupo_edad"] = data["edad_persona"].apply(categorizar_edad).astype(int)
 
-print(f"  • Distribución de riesgo:")
-print(data["nivel_riesgo"].value_counts().sort_index())
+print(f"      Registros finales: {len(data):,}")
 
-# === BALANCEAR CLASES ===
-print("\n⚖️ Balanceando clases...")
+# === FASE 3: CREAR GRID DE RIESGO ===
+print("\n📊 FASE 3: Calculando mapa de riesgo...")
+
+# Crear grid (0.01 grados ≈ 1.1 km)
+GRID_SIZE = 0.01
+data["lat_grid"] = (data["xx"] / GRID_SIZE).round() * GRID_SIZE
+data["lon_grid"] = (data["yy"] / GRID_SIZE).round() * GRID_SIZE
+
+# Contar accidentes por celda
+grid_counts = data.groupby(["lat_grid", "lon_grid"]).size().reset_index(name="num_accidentes")
+
+# Estadísticas adicionales por celda
+grid_stats = data.groupby(["lat_grid", "lon_grid"]).agg({
+    "hora": "mean",
+    "mes": lambda x: x.mode().iloc[0] if len(x) > 0 else x.iloc[0],
+    "edad_persona": "mean",
+    "es_fin_semana": "mean"
+}).reset_index()
+
+grid_data = grid_counts.merge(grid_stats, on=["lat_grid", "lon_grid"])
+
+# Clasificar nivel de riesgo
+percentiles = grid_data["num_accidentes"].quantile([0.33, 0.66])
+
+def clasificar_riesgo(num):
+    if num <= percentiles[0.33]:
+        return 0  # Bajo
+    elif num <= percentiles[0.66]:
+        return 1  # Medio
+    else:
+        return 2  # Alto
+
+grid_data["nivel_riesgo"] = grid_data["num_accidentes"].apply(clasificar_riesgo)
+
+print(f"   ✓ Celdas del grid: {len(grid_data):,}")
+print(f"   ✓ Distribución de riesgo:")
+for nivel, nombre in enumerate(["Bajo", "Medio", "Alto"]):
+    count = (grid_data["nivel_riesgo"] == nivel).sum()
+    pct = count / len(grid_data) * 100
+    print(f"      • {nombre}: {count:,} celdas ({pct:.1f}%)")
+
+# Guardar grid
+grid_path = os.path.join(MODEL_DIR, "risk_grid.csv")
+grid_data.to_csv(grid_path, index=False)
+print(f"   💾 Grid guardado: {grid_path}")
+
+# === FASE 4: CALCULAR DENSIDAD LOCAL ===
+print("\n🔍 FASE 4: Calculando densidad local...")
+
+# Unir datos con grid
+data = data.merge(
+    grid_data[["lat_grid", "lon_grid", "nivel_riesgo", "num_accidentes"]],
+    on=["lat_grid", "lon_grid"]
+)
+
+# Calcular densidad en radio (KD-Tree)
+coords = data[["xx", "yy"]].values
+tree = cKDTree(coords)
+
+print("   → Calculando vecinos cercanos (esto puede tardar)...")
+RADIO_KM = 2  # 2 km
+RADIO_GRADOS = RADIO_KM / 111  # Conversión aproximada
+
+densidades = []
+batch_size = 1000
+
+for i in range(0, len(coords), batch_size):
+    batch = coords[i:i+batch_size]
+    for coord in batch:
+        indices = tree.query_ball_point(coord, r=RADIO_GRADOS)
+        densidades.append(len(indices))
+    
+    if (i + batch_size) % 5000 == 0:
+        print(f"      Procesados: {min(i+batch_size, len(coords)):,} / {len(coords):,}")
+
+data["densidad_local"] = densidades
+print(f"   ✓ Densidad calculada para {len(data):,} registros")
+
+# === FASE 5: BALANCEO DE CLASES ===
+print("\n⚖️ FASE 5: Balanceando clases...")
+
+from sklearn.utils import resample
+
 df_por_clase = [data[data.nivel_riesgo == i] for i in range(3)]
-max_samples = max(len(df) for df in df_por_clase)
+
+# Encontrar el tamaño objetivo (promedio de las clases)
+sizes = [len(df) for df in df_por_clase]
+target_size = int(np.mean(sizes))
+
+print(f"   → Tamaño objetivo por clase: {target_size:,}")
 
 df_balanceados = []
 for i, df in enumerate(df_por_clase):
-    df_upsampled = resample(df, replace=True, n_samples=max_samples, random_state=42)
-    df_balanceados.append(df_upsampled)
-    print(f"  • Clase {i}: {len(df)} → {len(df_upsampled)}")
+    if len(df) < target_size:
+        # Oversample
+        df_resampled = resample(df, replace=True, n_samples=target_size, random_state=42)
+        print(f"      • Clase {i} (↑): {len(df):,} → {target_size:,}")
+    elif len(df) > target_size:
+        # Undersample
+        df_resampled = resample(df, replace=False, n_samples=target_size, random_state=42)
+        print(f"      • Clase {i} (↓): {len(df):,} → {target_size:,}")
+    else:
+        df_resampled = df
+        print(f"      • Clase {i} (=): {len(df):,}")
+    
+    df_balanceados.append(df_resampled)
 
 data_bal = pd.concat(df_balanceados, ignore_index=True)
+print(f"   ✓ Dataset balanceado: {len(data_bal):,} registros")
 
-# === FEATURES Y TARGET ===
-# NO incluir coordenadas directas, solo features derivadas
+# === FASE 6: PREPARAR FEATURES ===
+print("\n📦 FASE 6: Preparando features...")
+
 features = [
-    "edad_persona", "hora", "mes", "dia_semana", "es_fin_semana", "periodo_dia",
-    "cluster_zona", "dist_min_1", "dist_min_2", "dist_min_3", 
-    "densidad_local", "accidentes_cluster"
+    "edad_persona", "grupo_edad",
+    "hora", "mes", "dia_semana", "es_fin_semana", "periodo_dia",
+    "xx", "yy",
+    "densidad_local", "num_accidentes"
 ]
 
 X = data_bal[features]
 y = data_bal["nivel_riesgo"]
 
-# Guardar info de features para predicción
-feature_info = {
-    "feature_names": features,
-    "n_clusters": n_clusters,
-    "percentil_33": percentil_33,
-    "percentil_66": percentil_66,
-    "lat_min": data["xx"].min(),
-    "lat_max": data["xx"].max(),
-    "lon_min": data["yy"].min(),
-    "lon_max": data["yy"].max()
-}
-dump(feature_info, os.path.join(MODEL_DIR, "feature_info.joblib"))
+print(f"   ✓ Features: {len(features)}")
+print(f"   ✓ Muestras: {len(X):,}")
+print(f"   ✓ Distribución del target:")
+for nivel, nombre in enumerate(["Bajo", "Medio", "Alto"]):
+    count = (y == nivel).sum()
+    pct = count / len(y) * 100
+    print(f"      • {nombre}: {count:,} ({pct:.1f}%)")
 
-# === ESCALADO ===
-print("\n🔢 Escalando features...")
+# === FASE 7: ESCALADO ===
+print("\n🔢 FASE 7: Escalando features...")
+
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
 scaler_path = os.path.join(MODEL_DIR, "scaler.joblib")
 dump(scaler, scaler_path)
-print(f"  ✓ Escalador guardado: {scaler_path}")
+print(f"   💾 Scaler guardado: {scaler_path}")
 
-# === SPLIT ===
+# === FASE 8: SPLIT ===
+print("\n✂️ FASE 8: Dividiendo datos...")
+
 X_train, X_test, y_train, y_test = train_test_split(
-    X_scaled, y, test_size=0.2, random_state=42, stratify=y
+    X_scaled, y, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=y
 )
 
-print(f"\n📦 Datos de entrenamiento: {len(X_train)}")
-print(f"📦 Datos de prueba: {len(X_test)}")
+print(f"   ✓ Entrenamiento: {len(X_train):,} ({len(X_train)/len(X)*100:.1f}%)")
+print(f"   ✓ Prueba: {len(X_test):,} ({len(X_test)/len(X)*100:.1f}%)")
 
-# === MODELO MEJORADO ===
-print("\n🤖 Construyendo modelo...")
+# === FASE 9: ENTRENAMIENTO ===
+print("\n🌲 FASE 9: Entrenando Random Forest...")
 
-model = Sequential([
-    Dense(128, input_dim=X_train.shape[1], activation='relu'),
-    BatchNormalization(),
-    Dropout(0.4),
-    
-    Dense(64, activation='relu'),
-    BatchNormalization(),
-    Dropout(0.3),
-    
-    Dense(32, activation='relu'),
-    Dropout(0.2),
-    
-    Dense(3, activation='softmax')
-])
-
-model.compile(
-    optimizer='adam',
-    loss='sparse_categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-# Callbacks
-early_stop = EarlyStopping(
-    monitor='val_loss',
-    patience=20,
-    restore_best_weights=True,
+model = RandomForestClassifier(
+    n_estimators=200,
+    max_depth=20,
+    min_samples_split=10,
+    min_samples_leaf=5,
+    class_weight='balanced',
+    random_state=42,
+    n_jobs=-1,
     verbose=1
 )
 
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=7,
-    min_lr=1e-7,
-    verbose=1
-)
+print("   → Iniciando entrenamiento...")
+model.fit(X_train, y_train)
+print("   ✓ Entrenamiento completado")
 
-# === ENTRENAMIENTO ===
-print("\n🏋️ Entrenando modelo...")
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=150,
-    batch_size=64,
-    callbacks=[early_stop, reduce_lr],
-    verbose=1
-)
+# === FASE 10: EVALUACIÓN ===
+print("\n📊 FASE 10: Evaluando modelo...")
 
-# === EVALUACIÓN ===
-print("\n📊 Evaluando modelo...")
-y_pred_prob = model.predict(X_test, verbose=0)
-y_pred = np.argmax(y_pred_prob, axis=1)
+y_pred = model.predict(X_test)
+y_pred_prob = model.predict_proba(X_test)
 
 acc = accuracy_score(y_test, y_pred)
-print(f"\n🎯 Accuracy: {acc:.3f}")
-print("\n📋 Reporte de Clasificación:")
-print(classification_report(y_test, y_pred, 
-                          target_names=['Bajo', 'Medio', 'Alto']))
+print(f"\n   🎯 Accuracy: {acc:.3f} ({acc*100:.1f}%)")
 
-# Matriz de confusión
+print("\n   📋 Reporte de Clasificación:")
+print(classification_report(
+    y_test, y_pred, 
+    target_names=['Bajo', 'Medio', 'Alto'],
+    digits=3
+))
+
 cm = confusion_matrix(y_test, y_pred)
-print("\n🔢 Matriz de Confusión:")
-print(cm)
+print("   🔢 Matriz de Confusión:")
+print("        Pred: Bajo  Medio  Alto")
+for i, nombre in enumerate(['Bajo', 'Medio', 'Alto']):
+    print(f"   Real {nombre:5s}: {cm[i][0]:5d}  {cm[i][1]:5d}  {cm[i][2]:5d}")
 
-# === GUARDAR MÉTRICAS ===
+# Importancia de features
+feature_importance = pd.DataFrame({
+    'feature': features,
+    'importance': model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+print("\n   📈 Top 5 Features más importantes:")
+for idx, row in feature_importance.head(5).iterrows():
+    print(f"      • {row['feature']:20s}: {row['importance']:.4f}")
+
+# === FASE 11: GUARDAR MODELO ===
+print("\n💾 FASE 11: Guardando modelo y metadatos...")
+
+model_path = os.path.join(MODEL_DIR, "rf_model.joblib")
+dump(model, model_path)
+print(f"   ✓ Modelo: {model_path}")
+
+# Guardar metadata
+metadata = {
+    "feature_names": features,
+    "lat_min": float(data["xx"].min()),
+    "lat_max": float(data["xx"].max()),
+    "lon_min": float(data["yy"].min()),
+    "lon_max": float(data["yy"].max()),
+    "grid_size": GRID_SIZE,
+    "percentil_33": float(percentiles[0.33]),
+    "percentil_66": float(percentiles[0.66]),
+    "model_type": "RandomForest",
+    "accuracy": float(acc),
+    "n_estimators": 200,
+    "fecha_entrenamiento": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}
+
+metadata_path = os.path.join(MODEL_DIR, "model_metadata.joblib")
+dump(metadata, metadata_path)
+print(f"   ✓ Metadata: {metadata_path}")
+
+# Guardar métricas
 metrics = pd.DataFrame([{
     "accuracy": acc,
-    "fecha_entrenamiento": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "num_features": X_train.shape[1],
-    "num_samples_train": len(X_train),
-    "num_samples_test": len(X_test)
+    "fecha": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "num_features": len(features),
+    "train_samples": len(X_train),
+    "test_samples": len(X_test),
+    "model": "RandomForest"
 }])
 
 metrics_path = os.path.join(MODEL_DIR, "model_metrics.csv")
 metrics.to_csv(metrics_path, index=False)
-print(f"\n💾 Métricas guardadas: {metrics_path}")
+print(f"   ✓ Métricas: {metrics_path}")
 
-# === GUARDAR MODELO ===
-model_path = os.path.join(MODEL_DIR, "model_riesgo_accidentes.h5")
-model.save(model_path)
-print(f"✅ Modelo guardado: {model_path}")
+# === FASE 12: VISUALIZACIONES ===
+print("\n📈 FASE 12: Generando visualizaciones...")
 
-# === VISUALIZACIONES ===
-print("\n📈 Generando visualizaciones...")
 fecha_hora = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-# Gráfico 1: Pérdida y Accuracy
-plt.figure(figsize=(12, 5))
-
-plt.subplot(1, 2, 1)
-plt.plot(history.history['loss'], label='Entrenamiento', linewidth=2)
-plt.plot(history.history['val_loss'], label='Validación', linewidth=2)
-plt.title('Evolución de la Pérdida', fontsize=14, fontweight='bold')
-plt.xlabel('Época')
-plt.ylabel('Pérdida')
-plt.legend()
-plt.grid(alpha=0.3)
-
-plt.subplot(1, 2, 2)
-plt.plot(history.history['accuracy'], label='Entrenamiento', linewidth=2)
-plt.plot(history.history['val_accuracy'], label='Validación', linewidth=2)
-plt.title('Evolución de la Precisión', fontsize=14, fontweight='bold')
-plt.xlabel('Época')
-plt.ylabel('Accuracy')
-plt.legend()
-plt.grid(alpha=0.3)
-
+# 1. Matriz de confusión
+plt.figure(figsize=(10, 8))
+sns.heatmap(
+    cm, annot=True, fmt='d', cmap='RdYlGn_r',
+    xticklabels=['Bajo', 'Medio', 'Alto'],
+    yticklabels=['Bajo', 'Medio', 'Alto'],
+    cbar_kws={'label': 'Cantidad'}
+)
+plt.title('Matriz de Confusión - Random Forest', fontsize=16, fontweight='bold', pad=20)
+plt.ylabel('Valor Real', fontsize=12)
+plt.xlabel('Predicción', fontsize=12)
 plt.tight_layout()
-loss_plot = os.path.join(MODEL_DIR, f"training_history_{fecha_hora}.png")
-plt.savefig(loss_plot, dpi=300, bbox_inches='tight')
-print(f"  ✓ {loss_plot}")
-plt.close()
-
-# Gráfico 2: Matriz de confusión
-plt.figure(figsize=(8, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-            xticklabels=['Bajo', 'Medio', 'Alto'],
-            yticklabels=['Bajo', 'Medio', 'Alto'])
-plt.title('Matriz de Confusión', fontsize=14, fontweight='bold')
-plt.ylabel('Valor Real')
-plt.xlabel('Predicción')
 
 cm_plot = os.path.join(MODEL_DIR, f"confusion_matrix_{fecha_hora}.png")
 plt.savefig(cm_plot, dpi=300, bbox_inches='tight')
-print(f"  ✓ {cm_plot}")
+print(f"   ✓ {os.path.basename(cm_plot)}")
 plt.close()
 
-# Gráfico 3: Mapa de clusters
+# 2. Importancia de features
 plt.figure(figsize=(10, 8))
-scatter = plt.scatter(data['yy'], data['xx'], c=data['cluster_zona'], 
-                     cmap='tab20', alpha=0.6, s=1)
-plt.colorbar(scatter, label='Cluster')
-plt.xlabel('Longitud')
-plt.ylabel('Latitud')
-plt.title('Zonas de Accidentes (Clusters)', fontsize=14, fontweight='bold')
-plt.grid(alpha=0.3)
+plt.barh(feature_importance['feature'], feature_importance['importance'], color='steelblue')
+plt.xlabel('Importancia', fontsize=12)
+plt.title('Importancia de Features', fontsize=16, fontweight='bold', pad=20)
+plt.gca().invert_yaxis()
+plt.tight_layout()
 
-cluster_plot = os.path.join(MODEL_DIR, f"clusters_map_{fecha_hora}.png")
-plt.savefig(cluster_plot, dpi=300, bbox_inches='tight')
-print(f"  ✓ {cluster_plot}")
+importance_plot = os.path.join(MODEL_DIR, f"feature_importance_{fecha_hora}.png")
+plt.savefig(importance_plot, dpi=300, bbox_inches='tight')
+print(f"   ✓ {os.path.basename(importance_plot)}")
 plt.close()
 
-# === FUNCIÓN DE PREDICCIÓN MEJORADA ===
-print("\n🧪 Creando función de predicción...")
-
-def calcular_features_prediccion(edad, hora, mes, dia_semana, latitud, longitud):
-    """
-    Calcula todas las features necesarias para una predicción.
-    Maneja coordenadas fuera del rango de entrenamiento.
-    """
-    from joblib import load
-    
-    # Cargar modelos guardados
-    kmeans = load(os.path.join(MODEL_DIR, "kmeans_zonas.joblib"))
-    feature_info = load(os.path.join(MODEL_DIR, "feature_info.joblib"))
-    
-    # Features temporales
-    es_fin_semana = 1 if dia_semana >= 5 else 0
-    periodo = categorizar_hora(hora)
-    
-    # Verificar si está dentro del rango conocido
-    fuera_rango = (
-        latitud < feature_info["lat_min"] or latitud > feature_info["lat_max"] or
-        longitud < feature_info["lon_min"] or longitud > feature_info["lon_max"]
-    )
-    
-    if fuera_rango:
-        print(f"⚠️ ADVERTENCIA: Coordenadas fuera del área de entrenamiento")
-        print(f"   Rango válido: Lat [{feature_info['lat_min']:.2f}, {feature_info['lat_max']:.2f}]")
-        print(f"                  Lon [{feature_info['lon_min']:.2f}, {feature_info['lon_max']:.2f}]")
-        print(f"   Predicción puede ser imprecisa.\n")
-    
-    # Asignar al cluster más cercano
-    coords_nueva = np.array([[latitud, longitud]])
-    cluster_zona = kmeans.predict(coords_nueva)[0]
-    
-    # Calcular distancias a clusters
-    centroids = kmeans.cluster_centers_
-    distancias = []
-    for i in range(feature_info["n_clusters"]):
-        dist = np.sqrt(
-            (latitud - centroids[i][0])**2 + 
-            (longitud - centroids[i][1])**2
-        )
-        distancias.append(dist)
-    
-    distancias_sorted = sorted(distancias)
-    dist_min_1 = distancias_sorted[0]
-    dist_min_2 = distancias_sorted[1]
-    dist_min_3 = distancias_sorted[2]
-    
-    # Densidad local estimada (basada en distancia al cluster)
-    # Asumimos que más cerca del centro = mayor densidad
-    densidad_estimada = max(1, int(10 / (1 + dist_min_1)))
-    
-    # Accidentes del cluster (aproximado)
-    accidentes_cluster = 50  # Valor promedio
-    
-    return {
-        "edad_persona": edad,
-        "hora": hora,
-        "mes": mes,
-        "dia_semana": dia_semana,
-        "es_fin_semana": es_fin_semana,
-        "periodo_dia": periodo,
-        "cluster_zona": cluster_zona,
-        "dist_min_1": dist_min_1,
-        "dist_min_2": dist_min_2,
-        "dist_min_3": dist_min_3,
-        "densidad_local": densidad_estimada,
-        "accidentes_cluster": accidentes_cluster
-    }
-
-def predecir_riesgo(edad, hora, mes, dia_semana, latitud, longitud):
-    """
-    Predice el nivel de riesgo de un accidente.
-    
-    Retorna:
-        - nivel: 0 (Bajo), 1 (Medio), 2 (Alto)
-        - probabilidades: dict con probabilidades
-        - advertencia: bool si está fuera de rango
-    """
-    from joblib import load
-    
-    # Calcular features
-    features_dict = calcular_features_prediccion(
-        edad, hora, mes, dia_semana, latitud, longitud
-    )
-    
-    # Verificar rango
-    feature_info = load(os.path.join(MODEL_DIR, "feature_info.joblib"))
-    fuera_rango = (
-        latitud < feature_info["lat_min"] or latitud > feature_info["lat_max"] or
-        longitud < feature_info["lon_min"] or longitud > feature_info["lon_max"]
-    )
-    
-    # Crear array en el orden correcto
-    feature_names = feature_info["feature_names"]
-    X_nuevo = np.array([[features_dict[name] for name in feature_names]])
-    
-    # Escalar y predecir
-    scaler = load(os.path.join(MODEL_DIR, "scaler.joblib"))
-    X_nuevo_scaled = scaler.transform(X_nuevo)
-    
-    prob = model.predict(X_nuevo_scaled, verbose=0)[0]
-    nivel = np.argmax(prob)
-    
-    return {
-        "nivel": nivel,
-        "probabilidades": {
-            "bajo": float(prob[0]),
-            "medio": float(prob[1]),
-            "alto": float(prob[2])
-        },
-        "fuera_rango": fuera_rango,
-        "cluster_asignado": int(features_dict["cluster_zona"])
-    }
-
-# Ejemplos de predicción
-print("\n🧪 Ejemplos de predicción:\n")
-
-# Ejemplo 1: Dentro del rango
-print("1️⃣ Ubicación dentro del área de estudio:")
-resultado1 = predecir_riesgo(
-    edad=35, 
-    hora=18,
-    mes=4,
-    dia_semana=4,
-    latitud=data["xx"].median(),
-    longitud=data["yy"].median()
+# 3. Mapa de riesgo
+plt.figure(figsize=(14, 10))
+scatter = plt.scatter(
+    grid_data['lon_grid'], 
+    grid_data['lat_grid'],
+    c=grid_data['nivel_riesgo'],
+    s=grid_data['num_accidentes'] * 5,
+    cmap='RdYlGn_r',
+    alpha=0.6,
+    edgecolors='black',
+    linewidth=0.5
 )
-nombres_riesgo = ['BAJO', 'MEDIO', 'ALTO']
-print(f"   Nivel de riesgo: {nombres_riesgo[resultado1['nivel']]}")
-print(f"   Probabilidades: Bajo={resultado1['probabilidades']['bajo']:.2%}, "
-      f"Medio={resultado1['probabilidades']['medio']:.2%}, "
-      f"Alto={resultado1['probabilidades']['alto']:.2%}")
-print(f"   Cluster: {resultado1['cluster_asignado']}\n")
 
-# Ejemplo 2: Fuera del rango
-print("2️⃣ Ubicación fuera del área de estudio:")
-resultado2 = predecir_riesgo(
-    edad=35,
-    hora=18,
-    mes=4,
-    dia_semana=4,
-    latitud=-11.98,  # Lima (lejos de Arequipa)
-    longitud=-77.09
-)
-print(f"   Nivel de riesgo: {nombres_riesgo[resultado2['nivel']]}")
-print(f"   Probabilidades: Bajo={resultado2['probabilidades']['bajo']:.2%}, "
-      f"Medio={resultado2['probabilidades']['medio']:.2%}, "
-      f"Alto={resultado2['probabilidades']['alto']:.2%}")
+cbar = plt.colorbar(scatter, label='Nivel de Riesgo', ticks=[0, 1, 2])
+cbar.ax.set_yticklabels(['Bajo', 'Medio', 'Alto'])
 
-print("\n✨ ¡Entrenamiento completado exitosamente!")
-print("\n📝 IMPORTANTE:")
-print("   • El modelo fue entrenado solo con datos de accidentes")
-print("   • Las predicciones fuera del área de estudio son aproximaciones")
-print("   • Para mejor precisión, entrena con datos de toda la región")
+plt.xlabel('Longitud', fontsize=12)
+plt.ylabel('Latitud', fontsize=12)
+plt.title('Mapa de Riesgo de Accidentes\nArequipa-Camaná', 
+          fontsize=16, fontweight='bold', pad=20)
+plt.grid(alpha=0.3, linestyle='--')
+plt.tight_layout()
+
+map_plot = os.path.join(MODEL_DIR, f"risk_map_{fecha_hora}.png")
+plt.savefig(map_plot, dpi=300, bbox_inches='tight')
+print(f"   ✓ {os.path.basename(map_plot)}")
+plt.close()
+
+# === RESUMEN FINAL ===
+print("\n" + "="*70)
+print("✨ ¡ENTRENAMIENTO COMPLETADO EXITOSAMENTE!")
+print("="*70)
+print(f"\n📊 RESUMEN:")
+print(f"   • Accuracy: {acc:.1%}")
+print(f"   • Zonas mapeadas: {len(grid_data):,}")
+print(f"   • Área cubierta:")
+print(f"      Latitud:  [{metadata['lat_min']:.4f}, {metadata['lat_max']:.4f}]")
+print(f"      Longitud: [{metadata['lon_min']:.4f}, {metadata['lon_max']:.4f}]")
+print(f"\n📁 Archivos generados:")
+print(f"   • {os.path.basename(model_path)}")
+print(f"   • {os.path.basename(scaler_path)}")
+print(f"   • {os.path.basename(grid_path)}")
+print(f"   • {os.path.basename(metadata_path)}")
+print(f"   • 3 visualizaciones PNG")
+print("\n🚀 El modelo está listo para usar en la API")
+print("="*70 + "\n")
