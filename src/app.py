@@ -6,10 +6,15 @@ from joblib import load
 from datetime import datetime
 from scipy.spatial import cKDTree
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "..", "models")
+# === PATHS FLEXIBLES (funciona igual en local y Render) ===
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 
-MODEL_DIR = os.path.abspath(MODEL_DIR)
+# Si Render ejecuta desde /opt/render/project/src, asegura ruta absoluta correcta
+if not os.path.exists(MODEL_DIR):
+    MODEL_DIR = os.path.join(CURRENT_DIR, "models")  # fallback local
+
 
 # === PATHS DE ARCHIVOS ===
 MODEL_PATH = os.path.join(MODEL_DIR, "rf_model.joblib")
