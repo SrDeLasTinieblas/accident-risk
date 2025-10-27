@@ -9,6 +9,8 @@ from scipy.spatial import cKDTree
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "..", "models")
 
+MODEL_DIR = os.path.abspath(MODEL_DIR)
+
 # === PATHS DE ARCHIVOS ===
 MODEL_PATH = os.path.join(MODEL_DIR, "rf_model.joblib")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.joblib")
