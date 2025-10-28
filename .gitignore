@@ -33,7 +33,7 @@ desktop.ini
 
 # === Datos y modelos ===
 /data/
-*.csv
+# *.csv
 *.xlsx
 *.json
 *.parquet
