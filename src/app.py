@@ -10,14 +10,10 @@ from scipy.spatial import cKDTree
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Determinar si estamos en Render o local
-# En Render: /opt/render/project/src/src/app.py
-# En local: tu_proyecto/src/app.py
 if "/opt/render/project/src" in CURRENT_DIR:
-    # Estamos en Render
     PROJECT_ROOT = "/opt/render/project/src"
     MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 else:
-    # Estamos en local
     PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
     MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 
@@ -145,6 +141,47 @@ def obtener_info_grid(lat, lon):
         "confianza": "media" if distancia_km < 5 else "baja"
     }
 
+def calcular_radio_zona(num_accidentes, nivel_riesgo):
+    """
+    Calcula el radio de la zona de riesgo basado en el número de accidentes.
+    Más accidentes = radio mayor.
+    """
+    # Radio base según nivel de riesgo
+    radio_base = {
+        0: 50,   # Bajo: 50m
+        1: 100,  # Medio: 100m
+        2: 150   # Alto: 150m
+    }
+    
+    # Radio ajustado por densidad de accidentes
+    if num_accidentes >= 10:
+        multiplicador = 1.5
+    elif num_accidentes >= 5:
+        multiplicador = 1.2
+    else:
+        multiplicador = 1.0
+    
+    return int(radio_base.get(nivel_riesgo, 100) * multiplicador)
+
+def calcular_risk_score(nivel_riesgo, num_accidentes):
+    """
+    Calcula un score de riesgo normalizado entre 0 y 1.
+    Combina nivel de riesgo con número de accidentes.
+    """
+    # Score base según nivel
+    score_base = {
+        0: 0.3,   # Bajo
+        1: 0.6,   # Medio
+        2: 0.85   # Alto
+    }
+    
+    base = score_base.get(nivel_riesgo, 0.5)
+    
+    # Ajuste por número de accidentes (máximo +0.15)
+    ajuste = min(num_accidentes / 100, 0.15)
+    
+    return min(base + ajuste, 1.0)
+
 def predecir_riesgo(edad, hora, mes, dia_semana, lat, lon):
     """
     Realiza predicción usando estrategia híbrida:
@@ -168,10 +205,6 @@ def predecir_riesgo(edad, hora, mes, dia_semana, lat, lon):
     num_accidentes = info_grid["num_accidentes"]
     
     # Crear features en el orden correcto
-    # ["edad_persona", "grupo_edad", "hora", "mes", "dia_semana", 
-    #  "es_fin_semana", "periodo_dia", "xx", "yy", 
-    #  "densidad_local", "num_accidentes"]
-    
     features = np.array([[
         edad,
         grupo_edad,
@@ -250,6 +283,112 @@ def health():
         }
     }), 200
 
+@app.route("/risk-zones", methods=["GET"])
+def risk_zones():
+    """
+    Retorna todas las zonas de riesgo del grid.
+    
+    Parámetros query opcionales:
+    - min_risk: nivel mínimo de riesgo (0=Bajo, 1=Medio, 2=Alto). Default: 1 (Medio y Alto)
+    - min_accidents: número mínimo de accidentes. Default: 1
+    - limit: límite de zonas a retornar. Default: todas
+    - sort_by: ordenar por 'accidents' o 'risk'. Default: 'risk'
+    
+    Ejemplos:
+    - /risk-zones                          -> Todas las zonas con riesgo medio o alto
+    - /risk-zones?min_risk=2               -> Solo zonas de alto riesgo
+    - /risk-zones?min_accidents=5          -> Zonas con 5+ accidentes
+    - /risk-zones?limit=50&sort_by=accidents -> Top 50 zonas con más accidentes
+    """
+    try:
+        # Obtener parámetros
+        min_risk = int(request.args.get('min_risk', 1))  # Default: medio y alto
+        min_accidents = int(request.args.get('min_accidents', 1))
+        limit = request.args.get('limit', None)
+        sort_by = request.args.get('sort_by', 'risk')  # 'risk' o 'accidents'
+        
+        # Validar parámetros
+        if min_risk not in [0, 1, 2]:
+            return jsonify({
+                "error": "min_risk debe ser 0 (Bajo), 1 (Medio) o 2 (Alto)"
+            }), 400
+        
+        # Filtrar zonas
+        zonas_filtradas = grid_data[
+            (grid_data["nivel_riesgo"] >= min_risk) &
+            (grid_data["num_accidentes"] >= min_accidents)
+        ].copy()
+        
+        # Ordenar
+        if sort_by == 'accidents':
+            zonas_filtradas = zonas_filtradas.sort_values('num_accidentes', ascending=False)
+        else:  # sort_by == 'risk'
+            zonas_filtradas = zonas_filtradas.sort_values(
+                ['nivel_riesgo', 'num_accidentes'], 
+                ascending=[False, False]
+            )
+        
+        # Aplicar límite si existe
+        if limit:
+            try:
+                limit = int(limit)
+                zonas_filtradas = zonas_filtradas.head(limit)
+            except ValueError:
+                pass
+        
+        # Construir respuesta
+        zones = []
+        for _, row in zonas_filtradas.iterrows():
+            nivel_riesgo = int(row["nivel_riesgo"])
+            num_accidentes = int(row["num_accidentes"])
+            
+            zone = {
+                "latitude": float(row["lat_grid"]),
+                "longitude": float(row["lon_grid"]),
+                "risk_level": ["Bajo", "Medio", "Alto"][nivel_riesgo],
+                "risk_level_num": nivel_riesgo,
+                "risk_score": round(calcular_risk_score(nivel_riesgo, num_accidentes), 3),
+                "accident_count": num_accidentes,
+                "radius": calcular_radio_zona(num_accidentes, nivel_riesgo),
+            }
+            
+            zones.append(zone)
+        
+        # Estadísticas de las zonas retornadas
+        distribucion = zonas_filtradas["nivel_riesgo"].value_counts().to_dict()
+        
+        return jsonify({
+            "zones": zones,
+            "count": len(zones),
+            "statistics": {
+                "total_zones": len(zones),
+                "distribution": {
+                    "bajo": int(distribucion.get(0, 0)),
+                    "medio": int(distribucion.get(1, 0)),
+                    "alto": int(distribucion.get(2, 0))
+                },
+                "total_accidents": int(zonas_filtradas["num_accidentes"].sum()),
+                "avg_accidents_per_zone": round(zonas_filtradas["num_accidentes"].mean(), 2),
+                "max_accidents": int(zonas_filtradas["num_accidentes"].max())
+            },
+            "filters_applied": {
+                "min_risk_level": ["Bajo", "Medio", "Alto"][min_risk],
+                "min_accidents": min_accidents,
+                "limit": limit,
+                "sort_by": sort_by
+            },
+            "generated_at": datetime.now().isoformat()
+        }), 200
+    
+    except Exception as e:
+        app.logger.error(f"Error en /risk-zones: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": "Error al obtener zonas de riesgo",
+            "detalle": str(e)
+        }), 500
+
 @app.route("/predict", methods=["POST"])
 def predict():
     """
@@ -307,6 +446,7 @@ def predict():
         # Construir respuesta
         response = {
             "riskLevel": nombres_riesgo[nivel],
+            "probability": max(resultado["probabilidades"].values()),
             "probabilities": resultado["probabilidades"],
             "latitude": xx,
             "longitude": yy,
@@ -432,7 +572,7 @@ def info():
     """Información detallada sobre el modelo"""
     return jsonify({
         "modelo": "Predicción de Riesgo de Accidentes - Arequipa",
-        "version": "2.0",
+        "version": "2.1",
         "tipo": metadata["model_type"],
         "accuracy": round(metadata["accuracy"], 3),
         "features": metadata["feature_names"],
@@ -452,13 +592,25 @@ def info():
                 "max": round(metadata["lon_max"], 4)
             }
         },
-        "ejemplo_request": {
+        "endpoints": {
+            "/health": "Estado del servidor",
+            "/predict": "Predicción de riesgo para coordenadas específicas",
+            "/risk-zones": "Obtener todas las zonas de riesgo del mapa",
+            "/grid-info": "Información histórica de una zona",
+            "/stats": "Estadísticas generales",
+            "/info": "Información del modelo"
+        },
+        "ejemplo_request_predict": {
             "edad": 35,
             "hora": 18,
             "mes": 10,
             "dia_semana": 4,
             "xx": -16.4,
             "yy": -71.5
+        },
+        "ejemplo_request_risk_zones": {
+            "url": "/risk-zones?min_risk=2&min_accidents=5&limit=100",
+            "descripcion": "Top 100 zonas de alto riesgo con 5+ accidentes"
         }
     }), 200
 
@@ -472,6 +624,13 @@ if __name__ == "__main__":
     print(f"📍 Área:")
     print(f"   Lat: [{metadata['lat_min']:.2f}, {metadata['lat_max']:.2f}]")
     print(f"   Lon: [{metadata['lon_min']:.2f}, {metadata['lon_max']:.2f}]")
+    print("\n📋 Endpoints disponibles:")
+    print("   • GET  /health")
+    print("   • GET  /risk-zones")
+    print("   • POST /predict")
+    print("   • POST /grid-info")
+    print("   • GET  /stats")
+    print("   • GET  /info")
     print("="*60 + "\n")
     
     app.run(host="0.0.0.0", port=5000, debug=False)
