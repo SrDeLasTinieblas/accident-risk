@@ -8,13 +8,22 @@ from scipy.spatial import cKDTree
 
 # === PATHS FLEXIBLES (funciona igual en local y Render) ===
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 
-# Si Render ejecuta desde /opt/render/project/src, asegura ruta absoluta correcta
-if not os.path.exists(MODEL_DIR):
-    MODEL_DIR = os.path.join(CURRENT_DIR, "models")  # fallback local
+# Determinar si estamos en Render o local
+# En Render: /opt/render/project/src/src/app.py
+# En local: tu_proyecto/src/app.py
+if "/opt/render/project/src" in CURRENT_DIR:
+    # Estamos en Render
+    PROJECT_ROOT = "/opt/render/project/src"
+    MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
+else:
+    # Estamos en local
+    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+    MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 
+print(f"📂 Directorio actual: {CURRENT_DIR}")
+print(f"📂 Raíz del proyecto: {PROJECT_ROOT}")
+print(f"📂 Directorio de modelos: {MODEL_DIR}")
 
 # === PATHS DE ARCHIVOS ===
 MODEL_PATH = os.path.join(MODEL_DIR, "rf_model.joblib")
