@@ -288,29 +288,35 @@ def risk_zones():
     """
     Retorna todas las zonas de riesgo del grid.
     
-    Parámetros query opcionales:
-    - min_risk: nivel mínimo de riesgo (0=Bajo, 1=Medio, 2=Alto). Default: 1 (Medio y Alto)
+    Parámetros query opcionales (se pasan en la URL):
+    - min_risk: nivel mínimo de riesgo (0=Bajo, 1=Medio, 2=Alto). Default: 1
     - min_accidents: número mínimo de accidentes. Default: 1
     - limit: límite de zonas a retornar. Default: todas
     - sort_by: ordenar por 'accidents' o 'risk'. Default: 'risk'
     
     Ejemplos:
-    - /risk-zones                          -> Todas las zonas con riesgo medio o alto
-    - /risk-zones?min_risk=2               -> Solo zonas de alto riesgo
-    - /risk-zones?min_accidents=5          -> Zonas con 5+ accidentes
-    - /risk-zones?limit=50&sort_by=accidents -> Top 50 zonas con más accidentes
+    - GET /risk-zones
+    - GET /risk-zones?min_risk=2
+    - GET /risk-zones?min_accidents=5&limit=50&sort_by=accidents
     """
     try:
-        # Obtener parámetros
-        min_risk = int(request.args.get('min_risk', 1))  # Default: medio y alto
-        min_accidents = int(request.args.get('min_accidents', 1))
-        limit = request.args.get('limit', None)
-        sort_by = request.args.get('sort_by', 'risk')  # 'risk' o 'accidents'
+        # Obtener parámetros de query string (NO del body)
+        min_risk = request.args.get('min_risk', default=1, type=int)
+        min_accidents = request.args.get('min_accidents', default=1, type=int)
+        limit = request.args.get('limit', default=None, type=int)
+        sort_by = request.args.get('sort_by', default='risk', type=str)
         
         # Validar parámetros
         if min_risk not in [0, 1, 2]:
             return jsonify({
-                "error": "min_risk debe ser 0 (Bajo), 1 (Medio) o 2 (Alto)"
+                "error": "min_risk debe ser 0 (Bajo), 1 (Medio) o 2 (Alto)",
+                "valor_recibido": min_risk
+            }), 400
+        
+        if sort_by not in ['risk', 'accidents']:
+            return jsonify({
+                "error": "sort_by debe ser 'risk' o 'accidents'",
+                "valor_recibido": sort_by
             }), 400
         
         # Filtrar zonas
@@ -318,6 +324,19 @@ def risk_zones():
             (grid_data["nivel_riesgo"] >= min_risk) &
             (grid_data["num_accidentes"] >= min_accidents)
         ].copy()
+        
+        if len(zonas_filtradas) == 0:
+            return jsonify({
+                "zones": [],
+                "count": 0,
+                "message": "No se encontraron zonas con los filtros especificados",
+                "filters_applied": {
+                    "min_risk_level": ["Bajo", "Medio", "Alto"][min_risk],
+                    "min_accidents": min_accidents,
+                    "limit": limit,
+                    "sort_by": sort_by
+                }
+            }), 200
         
         # Ordenar
         if sort_by == 'accidents':
@@ -329,12 +348,8 @@ def risk_zones():
             )
         
         # Aplicar límite si existe
-        if limit:
-            try:
-                limit = int(limit)
-                zonas_filtradas = zonas_filtradas.head(limit)
-            except ValueError:
-                pass
+        if limit and limit > 0:
+            zonas_filtradas = zonas_filtradas.head(limit)
         
         # Construir respuesta
         zones = []
@@ -351,7 +366,6 @@ def risk_zones():
                 "accident_count": num_accidentes,
                 "radius": calcular_radio_zona(num_accidentes, nivel_riesgo),
             }
-            
             zones.append(zone)
         
         # Estadísticas de las zonas retornadas
@@ -368,8 +382,8 @@ def risk_zones():
                     "alto": int(distribucion.get(2, 0))
                 },
                 "total_accidents": int(zonas_filtradas["num_accidentes"].sum()),
-                "avg_accidents_per_zone": round(zonas_filtradas["num_accidentes"].mean(), 2),
-                "max_accidents": int(zonas_filtradas["num_accidentes"].max())
+                "avg_accidents_per_zone": round(zonas_filtradas["num_accidentes"].mean(), 2) if len(zonas_filtradas) > 0 else 0,
+                "max_accidents": int(zonas_filtradas["num_accidentes"].max()) if len(zonas_filtradas) > 0 else 0
             },
             "filters_applied": {
                 "min_risk_level": ["Bajo", "Medio", "Alto"][min_risk],
@@ -386,7 +400,8 @@ def risk_zones():
         traceback.print_exc()
         return jsonify({
             "error": "Error al obtener zonas de riesgo",
-            "detalle": str(e)
+            "detalle": str(e),
+            "tipo_error": type(e).__name__
         }), 500
 
 @app.route("/predict", methods=["POST"])
