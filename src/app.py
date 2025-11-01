@@ -6,10 +6,9 @@ from joblib import load
 from datetime import datetime
 from scipy.spatial import cKDTree
 
-# === PATHS FLEXIBLES (funciona igual en local y Render) ===
+# === PATHS FLEXIBLES ===
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Determinar si estamos en Render o local
 if "/opt/render/project/src" in CURRENT_DIR:
     PROJECT_ROOT = "/opt/render/project/src"
     MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
@@ -56,8 +55,46 @@ print("✅ Modelos cargados exitosamente")
 print(f"   • Tipo: {metadata['model_type']}")
 print(f"   • Accuracy: {metadata['accuracy']:.1%}")
 print(f"   • Zonas mapeadas: {len(grid_data):,}")
+print(f"   • Features esperadas: {len(metadata['feature_names'])}")
+print(f"   • Features: {metadata['feature_names']}")
 
 app = Flask(__name__)
+
+# === CARGAR DATOS HISTÓRICOS ===
+print("\n📊 Calculando estadísticas históricas globales...")
+
+# Cargar TODOS los datos originales para calcular promedios
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+import glob
+
+all_data = []
+for file in glob.glob(os.path.join(DATA_DIR, "*.xlsx")):
+    if not file.endswith("~$"):  # Ignorar archivos temporales de Excel
+        try:
+            df = pd.read_excel(file, engine='openpyxl')
+            all_data.append(df)
+        except:
+            pass
+
+if all_data:
+    datos_completos = pd.concat(all_data, ignore_index=True)
+    datos_completos["fec_hora_hecho"] = pd.to_datetime(datos_completos["fec_hora_hecho"], errors="coerce")
+    datos_completos["hora"] = datos_completos["fec_hora_hecho"].dt.hour
+    datos_completos["mes"] = datos_completos["fec_hora_hecho"].dt.month
+    datos_completos["dia_semana"] = datos_completos["fec_hora_hecho"].dt.dayofweek
+    
+    # Calcular promedios históricos globales
+    HIST_HORA = datos_completos.groupby("hora").size().to_dict()
+    HIST_MES = datos_completos.groupby("mes").size().to_dict()
+    HIST_DIA = datos_completos.groupby("dia_semana").size().to_dict()
+    
+    print(f"   ✓ Promedios históricos calculados: {len(HIST_HORA)} horas, {len(HIST_MES)} meses, {len(HIST_DIA)} días")
+else:
+    # Valores por defecto si no se pueden cargar los datos
+    HIST_HORA = {h: 500 for h in range(24)}
+    HIST_MES = {m: 1000 for m in range(1, 13)}
+    HIST_DIA = {d: 800 for d in range(7)}
+    print("   ⚠️  Usando valores históricos por defecto")
 
 # === FUNCIONES AUXILIARES ===
 
@@ -83,16 +120,16 @@ def categorizar_edad(edad):
     else:
         return 3  # Mayor
 
-def calcular_densidad_local(lat, lon, radio=0.02):
+def calcular_densidad_local(lat, lon, radio=0.045):
     """
-    Calcula densidad de accidentes en un radio (~2km).
+    Calcula densidad de accidentes en un radio (~5km).
     Busca celdas del grid cercanas.
     """
     punto = np.array([lat, lon])
     indices = grid_tree.query_ball_point(punto, r=radio)
     
     if not indices or len(indices) == 0:
-        return 1  # Densidad mínima si no hay datos cercanos
+        return 1  # Densidad mínima
     
     # Sumar accidentes de celdas cercanas
     densidad = grid_data.iloc[indices]["num_accidentes"].sum()
@@ -122,7 +159,6 @@ def obtener_info_grid(lat, lon):
     # Si no hay celda exacta, buscar la más cercana
     distancias, indices = grid_tree.query([lat, lon], k=1)
     
-    # Manejar resultado escalar o array
     if isinstance(indices, (int, np.integer)):
         idx = indices
         dist = distancias
@@ -131,7 +167,7 @@ def obtener_info_grid(lat, lon):
         dist = distancias[0] if len(distancias) > 0 else 0
     
     celda_cercana = grid_data.iloc[idx]
-    distancia_km = float(dist) * 111  # Convertir grados a km
+    distancia_km = float(dist) * 111
     
     return {
         "nivel_riesgo": int(celda_cercana["nivel_riesgo"]),
@@ -142,18 +178,9 @@ def obtener_info_grid(lat, lon):
     }
 
 def calcular_radio_zona(num_accidentes, nivel_riesgo):
-    """
-    Calcula el radio de la zona de riesgo basado en el número de accidentes.
-    Más accidentes = radio mayor.
-    """
-    # Radio base según nivel de riesgo
-    radio_base = {
-        0: 50,   # Bajo: 50m
-        1: 100,  # Medio: 100m
-        2: 150   # Alto: 150m
-    }
+    """Calcula el radio de la zona de riesgo"""
+    radio_base = {0: 50, 1: 100, 2: 150}
     
-    # Radio ajustado por densidad de accidentes
     if num_accidentes >= 10:
         multiplicador = 1.5
     elif num_accidentes >= 5:
@@ -164,31 +191,41 @@ def calcular_radio_zona(num_accidentes, nivel_riesgo):
     return int(radio_base.get(nivel_riesgo, 100) * multiplicador)
 
 def calcular_risk_score(nivel_riesgo, num_accidentes):
-    """
-    Calcula un score de riesgo normalizado entre 0 y 1.
-    Combina nivel de riesgo con número de accidentes.
-    """
-    # Score base según nivel
-    score_base = {
-        0: 0.3,   # Bajo
-        1: 0.6,   # Medio
-        2: 0.85   # Alto
-    }
-    
+    """Calcula un score de riesgo normalizado entre 0 y 1"""
+    score_base = {0: 0.3, 1: 0.6, 2: 0.85}
     base = score_base.get(nivel_riesgo, 0.5)
-    
-    # Ajuste por número de accidentes (máximo +0.15)
     ajuste = min(num_accidentes / 100, 0.15)
-    
     return min(base + ajuste, 1.0)
+
+def predecir_riesgo_con_seguridad(features_scaled, prob_grid=None):
+    """
+    Predice con umbral de seguridad ajustado.
+    Prioriza detectar riesgo ALTO (evita falsos negativos).
+    """
+    # Obtener probabilidades del modelo
+    probas = model.predict_proba(features_scaled)[0]
+    
+    # Si hay datos históricos del grid, combinar
+    if prob_grid is not None:
+        probas = probas * 0.6 + prob_grid * 0.4
+        probas = probas / probas.sum()
+        metodo = "hibrido"
+    else:
+        metodo = "modelo_ml"
+    
+    # ESTRATEGIA DE SEGURIDAD: Umbral bajo para riesgo alto
+    if probas[2] > 0.20:  # 20% de probabilidad de riesgo alto
+        return 2, probas, metodo
+    elif probas[1] > 0.30 and probas[0] < 0.50:
+        return 1, probas, metodo
+    else:
+        return np.argmax(probas), probas, metodo
 
 def predecir_riesgo(edad, hora, mes, dia_semana, lat, lon):
     """
-    Realiza predicción usando estrategia híbrida:
-    1. Obtiene información del grid histórico
-    2. Combina con predicción del modelo ML
+    Realiza predicción usando estrategia híbrida.
     """
-    # Verificar si está en el área de entrenamiento
+    # Verificar rango
     fuera_rango = (
         lat < metadata["lat_min"] or lat > metadata["lat_max"] or
         lon < metadata["lon_min"] or lon > metadata["lon_max"]
@@ -202,42 +239,45 @@ def predecir_riesgo(edad, hora, mes, dia_semana, lat, lon):
     # Información del grid
     info_grid = obtener_info_grid(lat, lon)
     densidad_local = calcular_densidad_local(lat, lon)
-    num_accidentes = info_grid["num_accidentes"]
     
-    # Crear features en el orden correcto
+    # Obtener promedios históricos
+    acc_hora_hist = HIST_HORA.get(hora, 500)
+    acc_mes_hist = HIST_MES.get(mes, 1000)
+    acc_dia_hist = HIST_DIA.get(dia_semana, 800)
+    
+    # ⚠️ CRÍTICO: Crear features en el ORDEN EXACTO del entrenamiento
+    # Orden: hora, mes, dia_semana, es_fin_semana, periodo_dia,
+    #        edad_persona, grupo_edad, xx, yy,
+    #        acc_hora_hist, acc_mes_hist, acc_dia_hist, densidad_local
     features = np.array([[
-        edad,
-        grupo_edad,
-        hora,
-        mes,
-        dia_semana,
-        es_fin_semana,
-        periodo,
-        lat,
-        lon,
-        densidad_local,
-        num_accidentes
+        hora,              # 0
+        mes,               # 1
+        dia_semana,        # 2
+        es_fin_semana,     # 3
+        periodo,           # 4
+        edad,              # 5
+        grupo_edad,        # 6
+        lat,               # 7
+        lon,               # 8
+        acc_hora_hist,     # 9
+        acc_mes_hist,      # 10
+        acc_dia_hist,      # 11
+        densidad_local     # 12
     ]])
     
-    # Escalar y predecir
+    # Escalar
     features_scaled = scaler.transform(features)
     
-    # Obtener probabilidades del modelo
-    prob_ml = model.predict_proba(features_scaled)[0]
-    
-    # Si hay datos históricos confiables, combinar predicciones
+    # Crear probabilidad del grid si hay datos exactos
+    prob_grid = None
     if info_grid["metodo"] == "grid_exacto":
-        # 60% modelo ML + 40% histórico
-        prob_final = prob_ml * 0.6
-        prob_final[info_grid["nivel_riesgo"]] += 0.4
-        prob_final = prob_final / prob_final.sum()
-        metodo = "hibrido"
-    else:
-        # Usar solo modelo ML
-        prob_final = prob_ml
-        metodo = "modelo_ml"
+        prob_grid = np.zeros(3)
+        prob_grid[info_grid["nivel_riesgo"]] = 1.0
     
-    nivel_final = int(np.argmax(prob_final))
+    # Predecir con seguridad
+    nivel_final, prob_final, metodo = predecir_riesgo_con_seguridad(
+        features_scaled, prob_grid
+    )
     
     return {
         "nivel": nivel_final,
@@ -250,7 +290,7 @@ def predecir_riesgo(edad, hora, mes, dia_semana, lat, lon):
         "confianza": info_grid["confianza"],
         "fuera_rango": fuera_rango,
         "info_zona": {
-            "accidentes_historicos": num_accidentes,
+            "accidentes_historicos": info_grid["num_accidentes"],
             "densidad_local": densidad_local,
             "tipo_dato": info_grid["metodo"]
         }
@@ -285,28 +325,13 @@ def health():
 
 @app.route("/risk-zones", methods=["GET"])
 def risk_zones():
-    """
-    Retorna todas las zonas de riesgo del grid.
-    
-    Parámetros query opcionales (se pasan en la URL):
-    - min_risk: nivel mínimo de riesgo (0=Bajo, 1=Medio, 2=Alto). Default: 1
-    - min_accidents: número mínimo de accidentes. Default: 1
-    - limit: límite de zonas a retornar. Default: todas
-    - sort_by: ordenar por 'accidents' o 'risk'. Default: 'risk'
-    
-    Ejemplos:
-    - GET /risk-zones
-    - GET /risk-zones?min_risk=2
-    - GET /risk-zones?min_accidents=5&limit=50&sort_by=accidents
-    """
+    """Retorna todas las zonas de riesgo del grid"""
     try:
-        # Obtener parámetros de query string (NO del body)
         min_risk = request.args.get('min_risk', default=1, type=int)
         min_accidents = request.args.get('min_accidents', default=1, type=int)
         limit = request.args.get('limit', default=None, type=int)
         sort_by = request.args.get('sort_by', default='risk', type=str)
         
-        # Validar parámetros
         if min_risk not in [0, 1, 2]:
             return jsonify({
                 "error": "min_risk debe ser 0 (Bajo), 1 (Medio) o 2 (Alto)",
@@ -319,7 +344,6 @@ def risk_zones():
                 "valor_recibido": sort_by
             }), 400
         
-        # Filtrar zonas
         zonas_filtradas = grid_data[
             (grid_data["nivel_riesgo"] >= min_risk) &
             (grid_data["num_accidentes"] >= min_accidents)
@@ -329,29 +353,20 @@ def risk_zones():
             return jsonify({
                 "zones": [],
                 "count": 0,
-                "message": "No se encontraron zonas con los filtros especificados",
-                "filters_applied": {
-                    "min_risk_level": ["Bajo", "Medio", "Alto"][min_risk],
-                    "min_accidents": min_accidents,
-                    "limit": limit,
-                    "sort_by": sort_by
-                }
+                "message": "No se encontraron zonas con los filtros especificados"
             }), 200
         
-        # Ordenar
         if sort_by == 'accidents':
             zonas_filtradas = zonas_filtradas.sort_values('num_accidentes', ascending=False)
-        else:  # sort_by == 'risk'
+        else:
             zonas_filtradas = zonas_filtradas.sort_values(
                 ['nivel_riesgo', 'num_accidentes'], 
                 ascending=[False, False]
             )
         
-        # Aplicar límite si existe
         if limit and limit > 0:
             zonas_filtradas = zonas_filtradas.head(limit)
         
-        # Construir respuesta
         zones = []
         for _, row in zonas_filtradas.iterrows():
             nivel_riesgo = int(row["nivel_riesgo"])
@@ -368,7 +383,6 @@ def risk_zones():
             }
             zones.append(zone)
         
-        # Estadísticas de las zonas retornadas
         distribucion = zonas_filtradas["nivel_riesgo"].value_counts().to_dict()
         
         return jsonify({
@@ -382,8 +396,8 @@ def risk_zones():
                     "alto": int(distribucion.get(2, 0))
                 },
                 "total_accidents": int(zonas_filtradas["num_accidentes"].sum()),
-                "avg_accidents_per_zone": round(zonas_filtradas["num_accidentes"].mean(), 2) if len(zonas_filtradas) > 0 else 0,
-                "max_accidents": int(zonas_filtradas["num_accidentes"].max()) if len(zonas_filtradas) > 0 else 0
+                "avg_accidents_per_zone": round(zonas_filtradas["num_accidentes"].mean(), 2),
+                "max_accidents": int(zonas_filtradas["num_accidentes"].max())
             },
             "filters_applied": {
                 "min_risk_level": ["Bajo", "Medio", "Alto"][min_risk],
@@ -400,41 +414,25 @@ def risk_zones():
         traceback.print_exc()
         return jsonify({
             "error": "Error al obtener zonas de riesgo",
-            "detalle": str(e),
-            "tipo_error": type(e).__name__
+            "detalle": str(e)
         }), 500
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    Endpoint principal de predicción.
-    
-    Body JSON esperado:
-    {
-        "edad": 35,
-        "hora": 18,
-        "mes": 10,
-        "dia_semana": 4,  // Opcional, default: día actual
-        "xx": -16.4,      // Latitud
-        "yy": -71.5       // Longitud
-    }
-    """
+    """Endpoint principal de predicción"""
     try:
         data = request.json
         
-        # Validar datos requeridos
         edad = data.get("edad")
         hora = data.get("hora")
         mes = data.get("mes")
-        xx = data.get("xx")  # Latitud
-        yy = data.get("yy")  # Longitud
+        xx = data.get("xx")
+        yy = data.get("yy")
         
-        # Día de la semana opcional
         dia_semana = data.get("dia_semana")
         if dia_semana is None:
             dia_semana = datetime.now().weekday()
         
-        # Validar campos requeridos
         if None in [edad, hora, mes, xx, yy]:
             return jsonify({
                 "error": "Faltan datos requeridos",
@@ -442,23 +440,20 @@ def predict():
                 "campos_opcionales": ["dia_semana"]
             }), 400
         
-        # Validar rangos
         if not (0 <= hora <= 23):
             return jsonify({"error": "hora debe estar entre 0 y 23"}), 400
         if not (1 <= mes <= 12):
             return jsonify({"error": "mes debe estar entre 1 y 12"}), 400
         if not (0 <= dia_semana <= 6):
-            return jsonify({"error": "dia_semana debe estar entre 0 (lunes) y 6 (domingo)"}), 400
+            return jsonify({"error": "dia_semana debe estar entre 0 y 6"}), 400
         if not (0 <= edad <= 120):
             return jsonify({"error": "edad debe estar entre 0 y 120"}), 400
         
-        # Realizar predicción
         resultado = predecir_riesgo(edad, hora, mes, dia_semana, xx, yy)
         
         nombres_riesgo = ['Bajo', 'Medio', 'Alto']
         nivel = resultado["nivel"]
         
-        # Construir respuesta
         response = {
             "riskLevel": nombres_riesgo[nivel],
             "probability": max(resultado["probabilidades"].values()),
@@ -475,7 +470,6 @@ def predict():
             "info_zona": resultado["info_zona"]
         }
         
-        # Agregar advertencia si está fuera de rango
         if resultado["fuera_rango"]:
             response["advertencia"] = {
                 "mensaje": "Las coordenadas están fuera del área de entrenamiento",
@@ -505,15 +499,7 @@ def predict():
 
 @app.route("/grid-info", methods=["POST"])
 def grid_info():
-    """
-    Obtiene información histórica de una zona específica.
-    
-    Body JSON:
-    {
-        "xx": -16.4,
-        "yy": -71.5
-    }
-    """
+    """Obtiene información histórica de una zona específica"""
     try:
         data = request.json
         lat = data.get("xx")
@@ -531,7 +517,7 @@ def grid_info():
         return jsonify({
             "nivel_riesgo": ["Bajo", "Medio", "Alto"][info["nivel_riesgo"]],
             "accidentes_historicos": info["num_accidentes"],
-            "densidad_radio_2km": densidad,
+            "densidad_radio_5km": densidad,
             "metodo": info["metodo"],
             "confianza": info["confianza"],
             "distancia_zona_cercana_km": info.get("distancia_km", 0)
@@ -569,16 +555,6 @@ def stats():
             "latitud": float(grid_data.loc[grid_data["num_accidentes"].idxmax(), "lat_grid"]),
             "longitud": float(grid_data.loc[grid_data["num_accidentes"].idxmax(), "lon_grid"]),
             "accidentes": int(grid_data["num_accidentes"].max())
-        },
-        "area_cobertura": {
-            "latitud": {
-                "min": round(metadata["lat_min"], 4),
-                "max": round(metadata["lat_max"], 4)
-            },
-            "longitud": {
-                "min": round(metadata["lon_min"], 4),
-                "max": round(metadata["lon_max"], 4)
-            }
         }
     }), 200
 
@@ -587,45 +563,22 @@ def info():
     """Información detallada sobre el modelo"""
     return jsonify({
         "modelo": "Predicción de Riesgo de Accidentes - Arequipa",
-        "version": "2.1",
+        "version": "2.5",
         "tipo": metadata["model_type"],
         "accuracy": round(metadata["accuracy"], 3),
         "features": metadata["feature_names"],
         "niveles_riesgo": ["Bajo", "Medio", "Alto"],
-        "metodos_prediccion": {
-            "hibrido": "Combina datos históricos (40%) con modelo ML (60%)",
-            "modelo_ml": "Usa solo el modelo cuando no hay datos históricos exactos"
-        },
-        "area_cobertura": {
-            "descripcion": "Coordenadas de entrenamiento (Arequipa-Camaná)",
-            "latitud": {
-                "min": round(metadata["lat_min"], 4),
-                "max": round(metadata["lat_max"], 4)
-            },
-            "longitud": {
-                "min": round(metadata["lon_min"], 4),
-                "max": round(metadata["lon_max"], 4)
-            }
+        "mejoras_seguridad": {
+            "umbral_ajustado": "20% probabilidad de riesgo alto activa alerta",
+            "prioridad": "Evitar falsos negativos (predecir bajo cuando es alto)"
         },
         "endpoints": {
             "/health": "Estado del servidor",
-            "/predict": "Predicción de riesgo para coordenadas específicas",
-            "/risk-zones": "Obtener todas las zonas de riesgo del mapa",
-            "/grid-info": "Información histórica de una zona",
-            "/stats": "Estadísticas generales",
-            "/info": "Información del modelo"
-        },
-        "ejemplo_request_predict": {
-            "edad": 35,
-            "hora": 18,
-            "mes": 10,
-            "dia_semana": 4,
-            "xx": -16.4,
-            "yy": -71.5
-        },
-        "ejemplo_request_risk_zones": {
-            "url": "/risk-zones?min_risk=2&min_accidents=5&limit=100",
-            "descripcion": "Top 100 zonas de alto riesgo con 5+ accidentes"
+            "/predict": "Predicción de riesgo",
+            "/risk-zones": "Zonas de riesgo",
+            "/grid-info": "Info histórica de zona",
+            "/stats": "Estadísticas",
+            "/info": "Info del modelo"
         }
     }), 200
 
@@ -636,9 +589,7 @@ if __name__ == "__main__":
     print(f"📊 Modelo: {metadata['model_type']}")
     print(f"🎯 Accuracy: {metadata['accuracy']:.1%}")
     print(f"🗺️  Zonas: {len(grid_data):,}")
-    print(f"📍 Área:")
-    print(f"   Lat: [{metadata['lat_min']:.2f}, {metadata['lat_max']:.2f}]")
-    print(f"   Lon: [{metadata['lon_min']:.2f}, {metadata['lon_max']:.2f}]")
+    print(f"🔧 Features: {len(metadata['feature_names'])}")
     print("\n📋 Endpoints disponibles:")
     print("   • GET  /health")
     print("   • GET  /risk-zones")

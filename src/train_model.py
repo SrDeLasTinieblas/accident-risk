@@ -49,18 +49,13 @@ print(f"\n✅ Total cargado: {len(dfs)} archivos | {len(data):,} registros")
 print("\n🔧 FASE 2: Preprocesamiento de datos...")
 
 print("   → Limpiando datos básicos...")
-# Columnas necesarias
 cols_necesarias = ["edad_persona", "xx", "yy", "fec_hora_hecho"]
 
-# Verificar que existan las columnas
 for col in cols_necesarias:
     if col not in data.columns:
         raise ValueError(f"❌ Columna '{col}' no encontrada en los datos")
 
-# Seleccionar solo columnas necesarias
 data = data[cols_necesarias].copy()
-
-# Eliminar filas con coordenadas nulas (crítico)
 data = data.dropna(subset=["xx", "yy", "fec_hora_hecho"])
 
 print(f"      Registros después de limpieza: {len(data):,}")
@@ -70,7 +65,6 @@ print("   → Procesando fechas y horas...")
 data["fec_hora_hecho"] = pd.to_datetime(data["fec_hora_hecho"], errors="coerce")
 data = data.dropna(subset=["fec_hora_hecho"])
 
-# Extraer componentes temporales
 data["hora"] = data["fec_hora_hecho"].dt.hour
 data["mes"] = data["fec_hora_hecho"].dt.month
 data["dia_semana"] = data["fec_hora_hecho"].dt.dayofweek
@@ -78,15 +72,12 @@ data["es_fin_semana"] = (data["dia_semana"] >= 5).astype(int)
 
 # === PROCESAMIENTO DE EDAD ===
 print("   → Procesando edad...")
-
-# Llenar edades nulas con la mediana
 edad_mediana = data["edad_persona"].median()
 data["edad_persona"] = data["edad_persona"].fillna(edad_mediana)
 
-# Categorizar horas del día
 def categorizar_hora(hora):
     if pd.isna(hora):
-        return 1  # Default: tarde
+        return 1
     if 6 <= hora < 12:
         return 0  # Mañana
     elif 12 <= hora < 18:
@@ -98,10 +89,9 @@ def categorizar_hora(hora):
 
 data["periodo_dia"] = data["hora"].apply(categorizar_hora)
 
-# Categorizar edad
 def categorizar_edad(edad):
     if pd.isna(edad):
-        return 2  # Default: adulto
+        return 2
     if edad < 18:
         return 0  # Menor
     elif edad < 30:
@@ -115,18 +105,15 @@ data["grupo_edad"] = data["edad_persona"].apply(categorizar_edad).astype(int)
 
 print(f"      Registros finales: {len(data):,}")
 
-# === FASE 3: CREAR GRID DE RIESGO ===
+# === FASE 3: CREAR GRID DE RIESGO (SOLO PARA MAPEO) ===
 print("\n📊 FASE 3: Calculando mapa de riesgo...")
 
-# Crear grid (0.01 grados ≈ 1.1 km)
 GRID_SIZE = 0.01
 data["lat_grid"] = (data["xx"] / GRID_SIZE).round() * GRID_SIZE
 data["lon_grid"] = (data["yy"] / GRID_SIZE).round() * GRID_SIZE
 
-# Contar accidentes por celda
 grid_counts = data.groupby(["lat_grid", "lon_grid"]).size().reset_index(name="num_accidentes")
 
-# Estadísticas adicionales por celda
 grid_stats = data.groupby(["lat_grid", "lon_grid"]).agg({
     "hora": "mean",
     "mes": lambda x: x.mode().iloc[0] if len(x) > 0 else x.iloc[0],
@@ -136,16 +123,15 @@ grid_stats = data.groupby(["lat_grid", "lon_grid"]).agg({
 
 grid_data = grid_counts.merge(grid_stats, on=["lat_grid", "lon_grid"])
 
-# Clasificar nivel de riesgo
 percentiles = grid_data["num_accidentes"].quantile([0.33, 0.66])
 
 def clasificar_riesgo(num):
     if num <= percentiles[0.33]:
-        return 0  # Bajo
+        return 0
     elif num <= percentiles[0.66]:
-        return 1  # Medio
+        return 1
     else:
-        return 2  # Alto
+        return 2
 
 grid_data["nivel_riesgo"] = grid_data["num_accidentes"].apply(clasificar_riesgo)
 
@@ -156,27 +142,20 @@ for nivel, nombre in enumerate(["Bajo", "Medio", "Alto"]):
     pct = count / len(grid_data) * 100
     print(f"      • {nombre}: {count:,} celdas ({pct:.1f}%)")
 
-# Guardar grid
 grid_path = os.path.join(MODEL_DIR, "risk_grid.csv")
 grid_data.to_csv(grid_path, index=False)
 print(f"   💾 Grid guardado: {grid_path}")
 
-# === FASE 4: CALCULAR DENSIDAD LOCAL ===
+# === FASE 4: CALCULAR DENSIDAD LOCAL (EN RADIO EXTENDIDO) ===
 print("\n🔍 FASE 4: Calculando densidad local...")
 
-# Unir datos con grid
-data = data.merge(
-    grid_data[["lat_grid", "lon_grid", "nivel_riesgo", "num_accidentes"]],
-    on=["lat_grid", "lon_grid"]
-)
-
-# Calcular densidad en radio (KD-Tree)
+# ⚠️ CLAVE: Calcular densidad ANTES de asignar el target
 coords = data[["xx", "yy"]].values
 tree = cKDTree(coords)
 
-print("   → Calculando vecinos cercanos (esto puede tardar)...")
-RADIO_KM = 2  # 2 km
-RADIO_GRADOS = RADIO_KM / 111  # Conversión aproximada
+print("   → Calculando vecinos cercanos...")
+RADIO_KM = 5  # Aumentado a 5 km para patrones más generales
+RADIO_GRADOS = RADIO_KM / 111
 
 densidades = []
 batch_size = 1000
@@ -193,14 +172,36 @@ for i in range(0, len(coords), batch_size):
 data["densidad_local"] = densidades
 print(f"   ✓ Densidad calculada para {len(data):,} registros")
 
-# === FASE 5: BALANCEO DE CLASES ===
-print("\n⚖️ FASE 5: Balanceando clases...")
+# === AHORA SÍ ASIGNAMOS EL TARGET ===
+data = data.merge(
+    grid_data[["lat_grid", "lon_grid", "nivel_riesgo"]],
+    on=["lat_grid", "lon_grid"]
+)
+
+# === FASE 5: FEATURES DE CONTEXTO HISTÓRICO ===
+print("\n🔄 FASE 5: Calculando features históricas...")
+
+# Calcular promedios históricos por hora del día
+hora_stats = data.groupby("hora").size().reset_index(name="accidentes_hora_historico")
+data = data.merge(hora_stats, on="hora")
+
+# Calcular promedios históricos por mes
+mes_stats = data.groupby("mes").size().reset_index(name="accidentes_mes_historico")
+data = data.merge(mes_stats, on="mes")
+
+# Calcular promedios por día de semana
+dia_stats = data.groupby("dia_semana").size().reset_index(name="accidentes_diasemana_historico")
+data = data.merge(dia_stats, on="dia_semana")
+
+print(f"   ✓ Features históricas agregadas")
+
+# === FASE 6: BALANCEO DE CLASES ===
+print("\n⚖️ FASE 6: Balanceando clases...")
 
 from sklearn.utils import resample
 
 df_por_clase = [data[data.nivel_riesgo == i] for i in range(3)]
 
-# Encontrar el tamaño objetivo (promedio de las clases)
 sizes = [len(df) for df in df_por_clase]
 target_size = int(np.mean(sizes))
 
@@ -209,11 +210,9 @@ print(f"   → Tamaño objetivo por clase: {target_size:,}")
 df_balanceados = []
 for i, df in enumerate(df_por_clase):
     if len(df) < target_size:
-        # Oversample
         df_resampled = resample(df, replace=True, n_samples=target_size, random_state=42)
         print(f"      • Clase {i} (↑): {len(df):,} → {target_size:,}")
     elif len(df) > target_size:
-        # Undersample
         df_resampled = resample(df, replace=False, n_samples=target_size, random_state=42)
         print(f"      • Clase {i} (↓): {len(df):,} → {target_size:,}")
     else:
@@ -225,14 +224,23 @@ for i, df in enumerate(df_por_clase):
 data_bal = pd.concat(df_balanceados, ignore_index=True)
 print(f"   ✓ Dataset balanceado: {len(data_bal):,} registros")
 
-# === FASE 6: PREPARAR FEATURES ===
-print("\n📦 FASE 6: Preparando features...")
+# === FASE 7: PREPARAR FEATURES (SIN DATA LEAKAGE) ===
+print("\n📦 FASE 7: Preparando features...")
 
+# ✅ FEATURES LIMPIAS (sin num_accidentes ni densidad_local directa)
 features = [
-    "edad_persona", "grupo_edad",
+    # Temporales
     "hora", "mes", "dia_semana", "es_fin_semana", "periodo_dia",
+    # Demográficas
+    "edad_persona", "grupo_edad",
+    # Geográficas (coordenadas originales, NO grid)
     "xx", "yy",
-    "densidad_local", "num_accidentes"
+    # Contexto histórico
+    "accidentes_hora_historico",
+    "accidentes_mes_historico",
+    "accidentes_diasemana_historico",
+    # Densidad (pero normalizada)
+    "densidad_local"
 ]
 
 X = data_bal[features]
@@ -246,8 +254,8 @@ for nivel, nombre in enumerate(["Bajo", "Medio", "Alto"]):
     pct = count / len(y) * 100
     print(f"      • {nombre}: {count:,} ({pct:.1f}%)")
 
-# === FASE 7: ESCALADO ===
-print("\n🔢 FASE 7: Escalando features...")
+# === FASE 8: ESCALADO ===
+print("\n🔢 FASE 8: Escalando features...")
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
@@ -256,8 +264,8 @@ scaler_path = os.path.join(MODEL_DIR, "scaler.joblib")
 dump(scaler, scaler_path)
 print(f"   💾 Scaler guardado: {scaler_path}")
 
-# === FASE 8: SPLIT ===
-print("\n✂️ FASE 8: Dividiendo datos...")
+# === FASE 9: SPLIT ===
+print("\n✂️ FASE 9: Dividiendo datos...")
 
 X_train, X_test, y_train, y_test = train_test_split(
     X_scaled, y, 
@@ -269,14 +277,16 @@ X_train, X_test, y_train, y_test = train_test_split(
 print(f"   ✓ Entrenamiento: {len(X_train):,} ({len(X_train)/len(X)*100:.1f}%)")
 print(f"   ✓ Prueba: {len(X_test):,} ({len(X_test)/len(X)*100:.1f}%)")
 
-# === FASE 9: ENTRENAMIENTO ===
-print("\n🌲 FASE 9: Entrenando Random Forest...")
+# === FASE 10: ENTRENAMIENTO ===
+print("\n🌲 FASE 10: Entrenando Random Forest...")
 
+# Hiperparámetros ajustados para evitar overfitting
 model = RandomForestClassifier(
-    n_estimators=200,
-    max_depth=20,
-    min_samples_split=10,
-    min_samples_leaf=5,
+    n_estimators=100,  # Reducido
+    max_depth=10,      # Limitado
+    min_samples_split=20,  # Aumentado
+    min_samples_leaf=10,   # Aumentado
+    max_features='sqrt',   # Reducido
     class_weight='balanced',
     random_state=42,
     n_jobs=-1,
@@ -287,8 +297,8 @@ print("   → Iniciando entrenamiento...")
 model.fit(X_train, y_train)
 print("   ✓ Entrenamiento completado")
 
-# === FASE 10: EVALUACIÓN ===
-print("\n📊 FASE 10: Evaluando modelo...")
+# === FASE 11: EVALUACIÓN ===
+print("\n📊 FASE 11: Evaluando modelo...")
 
 y_pred = model.predict(X_test)
 y_pred_prob = model.predict_proba(X_test)
@@ -317,16 +327,15 @@ feature_importance = pd.DataFrame({
 
 print("\n   📈 Top 5 Features más importantes:")
 for idx, row in feature_importance.head(5).iterrows():
-    print(f"      • {row['feature']:20s}: {row['importance']:.4f}")
+    print(f"      • {row['feature']:35s}: {row['importance']:.4f}")
 
-# === FASE 11: GUARDAR MODELO ===
-print("\n💾 FASE 11: Guardando modelo y metadatos...")
+# === FASE 12: GUARDAR MODELO ===
+print("\n💾 FASE 12: Guardando modelo y metadatos...")
 
 model_path = os.path.join(MODEL_DIR, "rf_model.joblib")
 dump(model, model_path)
 print(f"   ✓ Modelo: {model_path}")
 
-# Guardar metadata
 metadata = {
     "feature_names": features,
     "lat_min": float(data["xx"].min()),
@@ -338,7 +347,7 @@ metadata = {
     "percentil_66": float(percentiles[0.66]),
     "model_type": "RandomForest",
     "accuracy": float(acc),
-    "n_estimators": 200,
+    "n_estimators": 100,
     "fecha_entrenamiento": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 }
 
@@ -346,7 +355,6 @@ metadata_path = os.path.join(MODEL_DIR, "model_metadata.joblib")
 dump(metadata, metadata_path)
 print(f"   ✓ Metadata: {metadata_path}")
 
-# Guardar métricas
 metrics = pd.DataFrame([{
     "accuracy": acc,
     "fecha": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -360,8 +368,8 @@ metrics_path = os.path.join(MODEL_DIR, "model_metrics.csv")
 metrics.to_csv(metrics_path, index=False)
 print(f"   ✓ Métricas: {metrics_path}")
 
-# === FASE 12: VISUALIZACIONES ===
-print("\n📈 FASE 12: Generando visualizaciones...")
+# === FASE 13: VISUALIZACIONES ===
+print("\n📈 FASE 13: Generando visualizaciones...")
 
 fecha_hora = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 

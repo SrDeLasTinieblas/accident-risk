@@ -1,2 +1,2 @@
 accuracy,fecha,num_features,train_samples,test_samples,model
-1.0,2025-10-27 01:32:58,11,10159,2540,RandomForest
+0.8984251968503937,2025-11-01 14:37:46,13,10159,2540,RandomForest
