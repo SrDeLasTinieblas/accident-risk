@@ -6,16 +6,12 @@ from joblib import load
 from datetime import datetime
 from scipy.spatial import cKDTree
 
-# === PATHS FLEXIBLES ===
+# === PATHS ===
+# Layout: services/risk-api/{app,artifacts,training}  y  <repo>/data/raw
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-if "/opt/render/project/src" in CURRENT_DIR:
-    PROJECT_ROOT = "/opt/render/project/src"
-    MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
-else:
-    PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-    MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
-
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))  # services/risk-api
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(PROJECT_ROOT, "artifacts"))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.abspath(os.path.join(PROJECT_ROOT, "..", "..", "data", "raw")))
 print(f"📂 Directorio actual: {CURRENT_DIR}")
 print(f"📂 Raíz del proyecto: {PROJECT_ROOT}")
 print(f"📂 Directorio de modelos: {MODEL_DIR}")
@@ -64,7 +60,6 @@ app = Flask(__name__)
 print("\n📊 Calculando estadísticas históricas globales...")
 
 # Cargar TODOS los datos originales para calcular promedios
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 import glob
 
 all_data = []

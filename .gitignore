@@ -39,3 +39,22 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# --- Python / modelo ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv*/
+venv/
+env/
+.conda/
+*.pkl
+*.log
+
+# --- Datos crudos (no se versionan; ver README) ---
+/data/
+
+# --- Misc ---
+Thumbs.db
+desktop.ini
